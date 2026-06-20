@@ -92,11 +92,16 @@ static volatile float pitch_offset = 0.0f;
 static volatile float roll_offset = 0.0f;
 static int64_t last_timestamp = 0;
 
-static float yaw = 0.0f;
-static uint32_t no_motion_time_ms = 0;
-
 #define SW0_NODE DT_ALIAS(sw0)
 static const struct gpio_dt_spec recenter_button = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
+
+// --- Custom Modifications for Gyro-based Yaw-to-Roll Mapping ---
+// Accumulated Z-axis rotation (Yaw) in degrees
+static float custom_yaw = 0.0f;
+// Counter to track duration of absolute stationarity in Pitch and Roll for automatic recentering
+static uint32_t custom_no_motion_time_ms = 0;
+// -----------------------------------------------------------------
+
 
 
 static volatile float gyro_bias_x = 0.0f;
@@ -426,30 +431,36 @@ static void imu_work_fn(struct k_work* work) {
     gy = apply_deadzone(gy, imu_config.gyro_deadzone);
     gz = apply_deadzone(gz, imu_config.gyro_deadzone);
 
-    // Integrate Z-axis angular velocity over time to calculate Yaw.
-    // gz is in rad/s, convert to degrees/s by multiplying by RAD_TO_DEG
-    yaw += gz * RAD_TO_DEG * dt;
+    // --- Custom Gyro-based Yaw Integration ---
+    // Accumulate the unbiased, deadzoned angular velocity around the Z-axis (gyro Z) over delta time.
+    // Zephyr sensor readings are in radians/sec, so we multiply by RAD_TO_DEG to integrate in degrees.
+    custom_yaw += gz * RAD_TO_DEG * dt;
 
-    if (yaw > (float)imu_angle_clamp_limit) yaw = (float)imu_angle_clamp_limit;
-    if (yaw < -(float)imu_angle_clamp_limit) yaw = -(float)imu_angle_clamp_limit;
+    // Clamp the accumulated yaw to the current clamp limit setting configured in the Web UI
+    if (custom_yaw > (float)imu_angle_clamp_limit) custom_yaw = (float)imu_angle_clamp_limit;
+    if (custom_yaw < -(float)imu_angle_clamp_limit) custom_yaw = -(float)imu_angle_clamp_limit;
 
-    // Re-centering/drift mitigation:
-    // 1. If absolutely no motion on Pitch and Roll (gx == 0 && gy == 0) for > 3 seconds, reset yaw.
+    // --- Yaw Drift Mitigation & Re-centering Logic ---
+    // 1. Motion-based auto-recenter: If there is absolutely no rotational motion on Pitch (gx) and Roll (gy)
+    // (meaning their angular velocities are filtered out to exactly 0 by the deadzone) for more than 3 seconds,
+    // we assume the device is at rest and reset the accumulated yaw to zero to clear any integrated drift.
     if (gx == 0.0f && gy == 0.0f) {
-        no_motion_time_ms += (uint32_t)(dt * 1000.0f);
+        custom_no_motion_time_ms += (uint32_t)(dt * 1000.0f);
     } else {
-        no_motion_time_ms = 0;
+        custom_no_motion_time_ms = 0;
     }
 
-    // 2. Or if reset button (SW0) is pressed
+    // 2. Hardware button-based recenter: Check if SW0/Pin 0 is active (pulled low / grounded)
     bool button_pressed = false;
     if (device_is_ready(recenter_button.port)) {
         button_pressed = (gpio_pin_get_dt(&recenter_button) > 0);
     }
 
-    if (no_motion_time_ms >= 3000 || button_pressed) {
-        yaw = 0.0f;
+    // Reset yaw back to zero if either trigger condition is met
+    if (custom_no_motion_time_ms >= 3000 || button_pressed) {
+        custom_yaw = 0.0f;
     }
+    // ------------------------------------------
     
     float accel_mag = sqrtf(ax * ax + ay * ay + az * az);
     float filtered_mag = iir_update_magnitude(&magnitude_filter, accel_mag);
@@ -483,10 +494,16 @@ static void imu_work_fn(struct k_work* work) {
     float current_clamp_limit = (float)imu_angle_clamp_limit;
     int16_t pitch_scaled = scale_angle_to_int16(pitch_corrected, -current_clamp_limit, current_clamp_limit);
     
-    float yaw_reported = yaw;
+    // --- Custom Mapping Shortcut ---
+    // Instead of using the accelerometer-based roll angle (roll_corrected), we map our newly
+    // calculated, drift-mitigated gyro yaw onto the Roll channel.
+    // This allows physical foot pivoting (yaw) to control logical Roll (X-Axis output).
+    float yaw_reported = custom_yaw;
+    // Honor the Roll axis inversion setting from the Web UI config
     if (imu_roll_inverted) {
         yaw_reported = -yaw_reported;
     }
+    // Scale the yaw to the int16_t range expected by the HID reports
     int16_t roll_scaled = scale_angle_to_int16(yaw_reported, -current_clamp_limit, current_clamp_limit);
     uint16_t magnitude_scaled = scale_magnitude_to_uint16(hp_magnitude, 25.0f);
     
@@ -588,7 +605,8 @@ void imu_recalibrate_orientation() {
         pitch_filter.index = 0;
         roll_filter.index = 0;
         
-        yaw = 0.0f;
+        // Reset accumulated custom yaw to zero during orientation recalibration
+        custom_yaw = 0.0f;
 
     }
 }
@@ -616,7 +634,8 @@ void imu_recalibrate_sensors() {
         pitch_filter.index = 0;
         roll_filter.index = 0;
         
-        yaw = 0.0f;
+        // Reset accumulated custom custom_yaw to zero during sensor recalibration
+        custom_yaw = 0.0f;
 
     }
 }

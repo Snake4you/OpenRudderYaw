@@ -142,6 +142,27 @@ See [BLUETOOTH.md](./BLUETOOTH.md) for setup instructions.
 
 ---
 
+## 🔄 Gyro-Based Yaw-to-Roll Mapping (Custom Mod)
+
+This firmware contains a custom modification for the Seeed Studio XIAO nRF52840 Sense board that maps physical **Yaw** (Z-Axis rotation/pivoting) onto the logical **Roll** channel (X-Axis output). This allows users to control roll inputs by simply twisting or pivoting their foot instead of tilting it, bypassing physical strain.
+
+### Technical Implementation
+
+* **Z-Axis Gyro Integration:** The unbiased, deadzoned angular velocity from the Z-axis gyroscope (`gz` from the LSM6DSOX sensor) is integrated over delta time `dt` to compute a custom yaw angle:
+  `yaw += gyro_z * dt`
+* **HID Mapping Hijack:** The calculated `yaw` angle is mapped directly onto the Roll output field (`roll_scaled`) inside the custom HID report. It fully respects the **Invert roll axis** checkbox in the Web Configuration tool.
+* **Range Clamping:** The accumulated yaw value is automatically clamped using the user-defined `Angle limit` (from 1° to 90°) configured in the Web UI.
+
+### Drift Mitigation & Re-centering
+
+Since the board lacks a magnetometer, absolute yaw estimates will slowly drift over time due to sensor noise. The firmware incorporates two real-time correction methods:
+
+1. **Auto-Recentering (Motionless Check):** If the device detects absolutely no motion on both physical **Pitch** and **Roll** for **more than 3 seconds** (i.e. pitch and roll velocities `gx == 0` and `gy == 0`), the accumulated `yaw` is automatically reset to `0`.
+2. **Manual Hardware Recenter:** Pin 0 of the XIAO board (`SW0_NODE`) is monitored. Shorting **Pin 0 to GND** immediately resets the accumulated `yaw` to `0`.
+3. **Web Recenter:** Recalibrating sensors or orientation through the Web Config Tool also resets the accumulated `yaw` to `0`.
+
+---
+
 ## 🤝 Credits
 
 - **[HID Remapper](https://github.com/jfedor2/hid-remapper)** by jfedor — the foundation this project builds on
