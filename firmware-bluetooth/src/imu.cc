@@ -92,6 +92,13 @@ static volatile float pitch_offset = 0.0f;
 static volatile float roll_offset = 0.0f;
 static int64_t last_timestamp = 0;
 
+static float yaw = 0.0f;
+static uint32_t no_motion_time_ms = 0;
+
+#define SW0_NODE DT_ALIAS(sw0)
+static const struct gpio_dt_spec recenter_button = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
+
+
 static volatile float gyro_bias_x = 0.0f;
 static volatile float gyro_bias_y = 0.0f;
 static volatile float gyro_bias_z = 0.0f;
@@ -418,6 +425,31 @@ static void imu_work_fn(struct k_work* work) {
     gx = apply_deadzone(gx, imu_config.gyro_deadzone);
     gy = apply_deadzone(gy, imu_config.gyro_deadzone);
     gz = apply_deadzone(gz, imu_config.gyro_deadzone);
+
+    // Integrate Z-axis angular velocity over time to calculate Yaw.
+    // gz is in rad/s, convert to degrees/s by multiplying by RAD_TO_DEG
+    yaw += gz * RAD_TO_DEG * dt;
+
+    if (yaw > (float)imu_angle_clamp_limit) yaw = (float)imu_angle_clamp_limit;
+    if (yaw < -(float)imu_angle_clamp_limit) yaw = -(float)imu_angle_clamp_limit;
+
+    // Re-centering/drift mitigation:
+    // 1. If absolutely no motion on Pitch and Roll (gx == 0 && gy == 0) for > 3 seconds, reset yaw.
+    if (gx == 0.0f && gy == 0.0f) {
+        no_motion_time_ms += (uint32_t)(dt * 1000.0f);
+    } else {
+        no_motion_time_ms = 0;
+    }
+
+    // 2. Or if reset button (SW0) is pressed
+    bool button_pressed = false;
+    if (device_is_ready(recenter_button.port)) {
+        button_pressed = (gpio_pin_get_dt(&recenter_button) > 0);
+    }
+
+    if (no_motion_time_ms >= 3000 || button_pressed) {
+        yaw = 0.0f;
+    }
     
     float accel_mag = sqrtf(ax * ax + ay * ay + az * az);
     float filtered_mag = iir_update_magnitude(&magnitude_filter, accel_mag);
@@ -450,7 +482,12 @@ static void imu_work_fn(struct k_work* work) {
     
     float current_clamp_limit = (float)imu_angle_clamp_limit;
     int16_t pitch_scaled = scale_angle_to_int16(pitch_corrected, -current_clamp_limit, current_clamp_limit);
-    int16_t roll_scaled = scale_angle_to_int16(roll_corrected, -current_clamp_limit, current_clamp_limit);
+    
+    float yaw_reported = yaw;
+    if (imu_roll_inverted) {
+        yaw_reported = -yaw_reported;
+    }
+    int16_t roll_scaled = scale_angle_to_int16(yaw_reported, -current_clamp_limit, current_clamp_limit);
     uint16_t magnitude_scaled = scale_magnitude_to_uint16(hp_magnitude, 25.0f);
     
     imu_report_t imu_report = { 
@@ -551,6 +588,7 @@ void imu_recalibrate_orientation() {
         pitch_filter.index = 0;
         roll_filter.index = 0;
         
+        yaw = 0.0f;
 
     }
 }
@@ -578,6 +616,7 @@ void imu_recalibrate_sensors() {
         pitch_filter.index = 0;
         roll_filter.index = 0;
         
+        yaw = 0.0f;
 
     }
 }
